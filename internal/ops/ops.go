@@ -69,6 +69,9 @@ type AccountView struct {
 	GatewayCredits int64      `json:"credits"`
 	LiveCredits    *int64     `json:"live_credits,omitempty"`
 	CreditsAt      *time.Time `json:"credits_at,omitempty"`
+	// 积分到期：与 LiveCredits 同源同时刻（来自主动查询的积分包明细）。
+	CreditsExpireAt *string `json:"credits_expire_at,omitempty"`
+	CreditsExpiring *int64  `json:"credits_expiring,omitempty"`
 }
 
 // CreditsTotal 全局积分汇总。
@@ -141,6 +144,82 @@ type Service struct {
 
 	mu      sync.RWMutex
 	credits map[string]creditCache
+	promos  map[string]promoCache
+}
+
+// promoCache 促销缓存条目（按 realm 维度：促销是域级配置，同域账号看到的一致）。
+type promoCache struct {
+	promos []upstream.ModelPromotion
+	at     time.Time
+	err    string
+}
+
+// promoTTL 促销缓存时长。促销是营销配置，变化很慢，没必要每次开页面都打上游。
+const promoTTL = 10 * time.Minute
+
+// promoErrTTL 促销**失败**的缓存时长，比成功短得多。
+//
+// 失败往往是一次网络抖动或上游限流，不该让它把「优惠」列占掉 10 分钟；
+// 但也不能不缓存 —— 上游一直挂着时，每次开页面都同步等一次超时会很难受。
+const promoErrTTL = time.Minute
+
+// realmOfAccount 从账号 domain 反推域：含 workbuddy.ai 为 global，其余（copilot.tencent.com /
+// codebuddy.cn）为 cn。与网关 auth.Realm() 的判定口径一致。
+func realmOfAccount(a *authstore.Account) string {
+	if a != nil && strings.Contains(strings.ToLower(a.Domain), "workbuddy.ai") {
+		return "global"
+	}
+	return "cn"
+}
+
+// PromotionsForRealm 返回某域的模型促销配置（best-effort）。
+//
+// 每域挑一个未过期账号去取上游 /v3/config —— 网关不解析 modelPromotions，故 GUI 直连。
+// 命中缓存（promoTTL）时零上游调用；失败返回 (nil, 错误文案) 且不阻断调用方，
+// 促销拿不到不该让整个模型页打不开。
+func (s *Service) PromotionsForRealm(realm string) ([]upstream.ModelPromotion, string) {
+	s.mu.RLock()
+	c, ok := s.promos[realm]
+	s.mu.RUnlock()
+	if ok {
+		ttl := promoTTL
+		if c.err != "" {
+			ttl = promoErrTTL
+		}
+		if time.Since(c.at) < ttl {
+			return c.promos, c.err
+		}
+	}
+
+	accounts, _ := s.store.List()
+	var acct *authstore.Account
+	for _, a := range accounts {
+		if realmOfAccount(a) == realm && !a.Expired() {
+			acct = a
+			break
+		}
+	}
+	if acct == nil {
+		msg := "该域没有可用账号，无法查询促销"
+		s.mu.Lock()
+		s.promos[realm] = promoCache{at: time.Now(), err: msg}
+		s.mu.Unlock()
+		return nil, msg
+	}
+	if acct.NeedsRefresh(10 * time.Minute) {
+		// 过期前先续期，避免拿一个马上失效的 token 去打上游；失败不阻断（可能仍能读）。
+		_ = s.refreshAccount(acct)
+	}
+
+	promos, err := s.up.Promotions(acct)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		s.promos[realm] = promoCache{at: time.Now(), err: err.Error()}
+		return nil, err.Error()
+	}
+	s.promos[realm] = promoCache{promos: promos, at: time.Now()}
+	return promos, ""
 }
 
 // New 构建服务。
@@ -154,6 +233,7 @@ func New(cfg *config.Config, store *authstore.Store, gw *gateway.Client, up *ups
 		logins:  NewLoginManager(up),
 		pricing: pricing.New(cfg.PricingFile),
 		credits: map[string]creditCache{},
+		promos:  map[string]promoCache{},
 	}
 }
 
@@ -274,6 +354,12 @@ func (s *Service) Accounts(ctx context.Context) ([]AccountView, *gateway.Status,
 			at := c.at
 			v.LiveCredits = &remain
 			v.CreditsAt = &at
+			if c.credits.ExpiresAt != "" {
+				exp := c.credits.ExpiresAt
+				v.CreditsExpireAt = &exp
+			}
+			expiring := c.credits.ExpiringRemain
+			v.CreditsExpiring = &expiring
 		}
 	}
 	s.mu.RUnlock()
