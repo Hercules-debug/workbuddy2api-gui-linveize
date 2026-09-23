@@ -428,16 +428,8 @@ func (s *Service) Overview(ctx context.Context) *Overview {
 				fmt.Sprintf("账号 %s 在网关池中但磁盘无凭证文件，重启后将消失", shortUID(a.UID)))
 		}
 		if a.HasFile && !a.InGateway && status != nil {
-			// 区分两种成因，给出可操作的指引：
-			//  ① 凭证文件权限让网关读不到（容器里面板 root 写、网关低权限用户读）
-			//     —— 这种情况单纯重启网关也没用，必须先修权限。
-			//  ② 权限正常，只是网关还没重启扫描到新文件。
-			if hint := s.credentialReadabilityHint(a.UID); hint != "" {
-				ov.Warnings = append(ov.Warnings, fmt.Sprintf("账号 %s 已落盘但网关无法读取：%s", shortUID(a.UID), hint))
-			} else {
-				ov.Warnings = append(ov.Warnings,
-					fmt.Sprintf("账号 %s 有凭证文件但不在网关池中，需重启网关加载", shortUID(a.UID)))
-			}
+			ov.Warnings = append(ov.Warnings, fmt.Sprintf("账号 %s 有凭证文件但不在网关池中：%s",
+				shortUID(a.UID), s.credentialLoadHint(a.UID)))
 		}
 		// 积分汇总口径：主动查询结果优先，其次用网关 /status 里缓存的积分。
 		// 两者都没有（例如凭证文件存在但网关未加载该账号）才算「未取到」，据实计入 failed。
@@ -885,39 +877,56 @@ type StateFileInfo struct {
 	Err      string    `json:"error,omitempty"`
 }
 
-// credentialReadabilityHint 检查凭证文件是否「对其他用户不可读」。
+// credentialLoadHint 解释「磁盘有凭证文件、但网关池里没有」该怎么处理。
 //
-// 场景：面板以 root 运行（写宿主机挂载的凭证目录），网关容器以低权限用户
-// （官方镜像里是 uid 10001 的 app）读取同一目录。若凭证是 root:600，网关
-// open() 会 permission denied，账号永远加载不进池 —— 此时只提示「重启网关」
-// 会误导用户（重启也没用）。这里检出该情况并给出具体修法。
+// 控制台只看得到自己这侧的目录，看不到网关那侧的文件系统，所以成因得靠现有线索
+// 推，而不是一口咬定「权限让网关读不到」。按线索分三种：
 //
-// 返回空串表示权限没问题（那么「未加载」的原因就只剩「网关还没重启」）。
-func (s *Service) credentialReadabilityHint(uid string) string {
+//  1. 文件对同组/其他用户可读 —— 网关哪怕以别的用户运行也读得到，成因只剩
+//     「网关还没重新扫描目录」（网关只在启动时读一次 auths/）。
+//  2. 配了 auth_owner_uid/auth_owner_gid，但文件属主没跟着变 —— 落盘那步没生效。
+//  3. 文件属主是 root 且仅 root 可读 —— 真正的隐患：非 root 的网关进程一定读不到
+//     （容器部署正是这种：面板以 root 落盘，网关以 uid 10001 的 app 运行）。
+//     其余属主（比如本控制台进程自己）则同机同用户的网关读得到。
+//
+// 注意别建议 chown 到文件当前属主 —— 那是空操作，等于没给建议。
+func (s *Service) credentialLoadHint(uid string) string {
 	p := s.store.PathFor(uid)
-	if p == "" {
-		return ""
-	}
 	st, err := os.Stat(p)
-	if err != nil {
-		return ""
+	if p == "" || err != nil {
+		return "需重启网关加载"
 	}
 	mode := st.Mode().Perm()
-	// 组/其他用户可读 → 网关（不同用户）也能读，无权限问题。
-	if mode&0o044 != 0 {
-		return ""
-	}
+	file := "auths/workbuddy-" + shortUID(uid) + ".json"
 	uid2, gid := s.store.Owner()
-	if fuid, fgid, ok := fsutil.FileOwner(st); ok {
-		ownerLine := fmt.Sprintf("当前属主 %d:%d 权限 %o", fuid, fgid, mode)
-		fix := fmt.Sprintf("执行 chown %d:%d %s（或设置配置项 auth_owner_uid/auth_owner_gid）",
-			fuid, fgid, "auths/workbuddy-"+shortUID(uid)+".json")
-		if uid2 >= 0 || gid >= 0 {
-			fix = fmt.Sprintf("面板已配置 auth_owner_uid=%d，但本次写入未生效，请检查挂载目录权限", uid2)
-		}
-		return ownerLine + "，网关以其他用户运行故读不到；" + fix
+	fuid, fgid, haveOwner := fsutil.FileOwner(st)
+	owner := fmt.Sprintf("%d:%d", fuid, fgid)
+	if !haveOwner {
+		owner = "未知"
 	}
-	return fmt.Sprintf("文件权限 %o 可能过于严格，网关进程读不到", mode)
+
+	if mode&0o044 != 0 {
+		return "文件对同组/其他用户可读，网关读得到 —— 多半只是还没重新扫描目录，到「系统」页重启网关即可"
+	}
+	// 配了目标属主：属主是否真的跟着变了，决定是「落盘那步没生效」还是「权限没问题」。
+	// 只看「配置有没有设」会误报 —— 配置生效时文件本来就该是那个属主。
+	if uid2 >= 0 || gid >= 0 {
+		matched := haveOwner && (uid2 < 0 || fuid == uid2) && (gid < 0 || fgid == gid)
+		if matched {
+			return "文件属主与配置的 auth_owner_uid/auth_owner_gid 一致，权限没问题 —— " +
+				"多半只是还没重新扫描目录，到「系统」页重启网关即可"
+		}
+		return fmt.Sprintf("已配置 auth_owner_uid=%d/auth_owner_gid=%d，但该文件属主是 %s，"+
+			"落盘时未改成，请检查挂载目录权限", uid2, gid, owner)
+	}
+	if haveOwner && fuid == 0 {
+		return fmt.Sprintf("文件属主是 root 且仅属主可读（%o）。若网关以其他用户运行（容器部署：官方镜像是 "+
+			"uid 10001 的 app），它会因权限拒绝跳过该文件，重启无效 —— 把 auth_owner_uid/auth_owner_gid "+
+			"设为网关进程的 uid:gid 后重新落盘，或直接 chmod 0644 %s", mode, file)
+	}
+	return fmt.Sprintf("文件属主是 %s 且仅属主可读（%o）。若网关与本控制台同机且同用户，读得到，"+
+		"多半只是还没重新扫描目录，重启网关即可；若两者各读各的 auths 目录（跨机部署），"+
+		"文件不在网关那台机器上，需先把凭证部署过去", owner, mode)
 }
 
 func shortUID(uid string) string {
