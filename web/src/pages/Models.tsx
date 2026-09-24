@@ -176,6 +176,19 @@ export default function Models() {
     return out
   }, [models])
 
+  // 首次加载后自动切到「有模型的域」。
+  //
+  // 默认 tab 原先是硬编码 global，但只有国内版账号时该 tab 恒为空 ——
+  // 用户打开页面看到的是一片"没有匹配的模型"，像是功能坏了。
+  // 只在用户**尚未手动切过** tab 时才自动选（之后尊重用户选择）。
+  const [realmTouched, setRealmTouched] = useState(false)
+  useEffect(() => {
+    if (realmTouched || models.length === 0) return
+    if (countByRealm[realm] > 0) return // 当前 tab 有内容，不必动
+    const other: Realm = realm === 'global' ? 'cn' : 'global'
+    if (countByRealm[other] > 0) setRealm(other)
+  }, [models, countByRealm, realm, realmTouched])
+
   // 每个域里有优惠的模型数（含时段型），tab 上提示用。
   const promoByRealm = useMemo(() => {
     const out: Record<Realm, number> = { global: 0, cn: 0 }
@@ -275,7 +288,10 @@ export default function Models() {
           <button
             key={r.key}
             className={`tab ${realm === r.key ? 'active' : ''}`}
-            onClick={() => setRealm(r.key)}
+            onClick={() => {
+              setRealm(r.key)
+              setRealmTouched(true) // 用户手动选过，之后不再自动切换
+            }}
           >
             {r.label}
             <span className="text-faint"> · {countByRealm[r.key]}</span>
@@ -435,8 +451,9 @@ export default function Models() {
           只在每天固定时段生效（跨零点写成 <span className="mono">23:00–次日 07:50</span>）。
           徽标虚线表示 3 天内到期，鼠标悬停可看上游原文与精确起止时间。
           <span className="text-faint">已结束的活动不展示（上游会把它们继续挂在配置里）。</span>
-          调用时模型名要带域前缀，照抄上表第一列下方的{' '}
-          <span className="mono">global:xxx</span> / <span className="mono">cn:xxx</span> 即可。
+          调用时<strong>直接填第一列的模型 ID</strong>（如{' '}
+          <span className="mono">glm-5.3</span>）—— 网关按账号所属域自动路由，
+          <span className="text-faint">不要加「域前缀」，上游不认这种写法。</span>
           <br />
           能力列只列<span className="mono">工具</span>与<span className="mono">推理</span>：
           <span className="text-faint">图片能力不展示</span> —— 上游的{' '}
