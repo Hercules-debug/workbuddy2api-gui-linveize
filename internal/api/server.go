@@ -107,6 +107,8 @@ func (s *Server) Handler() http.Handler {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	// 注意：积分补齐不在这里做。所有展示积分的页面（账号页、仪表盘）
+	// 都会调 /api/accounts，故统一由 handleAccounts 触发，避免重复。
 	writeJSON(w, http.StatusOK, s.svc.Overview(r.Context()))
 }
 
@@ -116,6 +118,10 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// 顺带在后台补齐积分（issue #8）：外部渠道写入的账号在网关池里 credits
+	// 初值为 0，而网关只在签到任务里更新它——不主动查就会一直显示 0。
+	// 异步执行，不阻塞本响应；前端 20 秒轮询即可看到结果。
+	s.svc.EnsureCredits(accounts)
 	resp := map[string]any{
 		"accounts":    accounts,
 		"file_issues": issues,

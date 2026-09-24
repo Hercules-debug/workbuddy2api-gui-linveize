@@ -145,6 +145,8 @@ type Service struct {
 	mu      sync.RWMutex
 	credits map[string]creditCache
 	promos  map[string]promoCache
+	// creditLoading 标记「正在后台查询积分」的 uid，用于单飞（避免重复打上游）。
+	creditLoading map[string]bool
 }
 
 // promoCache 促销缓存条目（按 realm 维度：促销是域级配置，同域账号看到的一致）。
@@ -225,15 +227,16 @@ func (s *Service) PromotionsForRealm(realm string) ([]upstream.ModelPromotion, s
 // New 构建服务。
 func New(cfg *config.Config, store *authstore.Store, gw *gateway.Client, up *upstream.Client) *Service {
 	return &Service{
-		cfg:     cfg,
-		store:   store,
-		gw:      gw,
-		up:      up,
-		tasks:   NewTaskManager(),
-		logins:  NewLoginManager(up),
-		pricing: pricing.New(cfg.PricingFile),
-		credits: map[string]creditCache{},
-		promos:  map[string]promoCache{},
+		cfg:           cfg,
+		store:         store,
+		gw:            gw,
+		up:            up,
+		tasks:         NewTaskManager(),
+		logins:        NewLoginManager(up),
+		pricing:       pricing.New(cfg.PricingFile),
+		credits:       map[string]creditCache{},
+		promos:        map[string]promoCache{},
+		creditLoading: map[string]bool{},
 	}
 }
 
@@ -464,6 +467,72 @@ func (s *Service) Overview(ctx context.Context) *Overview {
 	ov.Credits.Failed = ov.Credits.Accounts - ov.Credits.OK
 	return ov
 }
+
+// 积分缓存的「新鲜」时长。
+//
+// 取值权衡：积分只在调用模型时消耗，变化不快；但用户刚用过就打开页面会希望
+// 看到接近实时的数字。5 分钟既避免了每次翻页都打上游（N 个账号 × 一次请求），
+// 又不会让数字陈旧到误导。
+const creditTTL = 5 * time.Minute
+
+// EnsureCredits 为「尚无缓存或缓存已过期」的账号在后台补齐积分。
+//
+// 设计取态：
+//   - **异步**：调用方（Accounts）是页面请求路径，不能为上游查询阻塞数秒。
+//   - **单飞**：同一 uid 已有在途查询时跳过，避免用户狂点刷新把上游打爆。
+//   - **只查缺失**：TTL 内的缓存直接复用，不重复打上游。
+//
+// 这是 issue #8 的修复：外部渠道（如 workbuddy-manager）写入 auths/ 的账号，
+// 网关池里的 credits 初值是 0，而网关只在签到任务里才更新它——于是账号页
+// 一直显示 0。现在控制台自己直连上游补齐，不依赖网关是否跑过签到。
+func (s *Service) EnsureCredits(views []AccountView) {
+	now := time.Now()
+
+	s.mu.Lock()
+	if s.creditLoading == nil {
+		s.creditLoading = map[string]bool{}
+	}
+	var todo []string
+	for _, v := range views {
+		if !v.HasFile {
+			continue // 无凭证文件，查不了
+		}
+		if c, ok := s.credits[v.UID]; ok && c.credits != nil && now.Sub(c.at) < creditTTL {
+			continue // 缓存新鲜
+		}
+		if s.creditLoading[v.UID] {
+			continue // 已有在途查询
+		}
+		s.creditLoading[v.UID] = true
+		todo = append(todo, v.UID)
+	}
+	s.mu.Unlock()
+
+	if len(todo) == 0 {
+		return
+	}
+	go func() {
+		// 串行 + 间隔：与批量查询保持一致的限速口径，避免触发上游风控。
+		for i, uid := range todo {
+			if i > 0 {
+				time.Sleep(creditQueryInterval)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), creditQueryTimeout)
+			_, _ = s.CreditsFor(ctx, uid) // 结果已进缓存，失败也会写入错误
+			cancel()
+
+			s.mu.Lock()
+			delete(s.creditLoading, uid)
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// 后台补积分任务的限速与超时。
+const (
+	creditQueryInterval = 300 * time.Millisecond
+	creditQueryTimeout  = 20 * time.Second
+)
 
 // ---------------------------------------------------------------------------
 // 单账号操作
